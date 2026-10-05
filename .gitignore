@@ -1,0 +1,13 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# OS & Editor generated files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Logs & Temporary outputs
+*.log
+*.txt
