@@ -1,50 +1,8 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use state_search_engine::engine::SearchEngine;
 use state_search_engine::frontier::{PartitionedFrontier, SharedCasFrontier};
-use state_search_engine::node::StateNode;
-
-fn generate_uniform_graph(node_count: usize) -> Vec<StateNode> {
-    let mut nodes = Vec::with_capacity(node_count);
-
-    for i in 0..node_count {
-        let target_1 = ((i * 7) + 1) % node_count;
-        let target_2 = ((i * 13) + 3) % node_count;
-
-        nodes.push(StateNode {
-            node_id: i as u32,
-            structural_mask: 0,
-            outbound_count: 2,
-            metadata_flags: 0,
-            outbound_links: [target_1 as u32, target_2 as u32, u32::MAX, u32::MAX],
-        });
-    }
-
-    nodes
-}
-
-fn generate_power_law_graph(node_count: usize) -> Vec<StateNode> {
-    let mut nodes = Vec::with_capacity(node_count);
-    let hub_node = 0u32;
-
-    for i in 0..node_count {
-        let target_1 = if i % 5 != 0 {
-            hub_node
-        } else {
-            ((i * 7) + 1) as u32 % node_count as u32
-        };
-        let target_2 = ((i * 13) + 3) as u32 % node_count as u32;
-
-        nodes.push(StateNode {
-            node_id: i as u32,
-            structural_mask: 0,
-            outbound_count: 2,
-            metadata_flags: 0,
-            outbound_links: [target_1, target_2, u32::MAX, u32::MAX],
-        });
-    }
-
-    nodes
-}
+use state_search_engine::graph::{generate_rmat_graph, generate_uniform_graph, RmatConfig};
+use state_search_engine::node::{StateNode, MAX_INLINE_EDGES};
 
 fn naive_bfs_edge_count(nodes: &[StateNode], start_node_id: u32) -> u64 {
     let mut visited = vec![false; nodes.len()];
@@ -57,7 +15,8 @@ fn naive_bfs_edge_count(nodes: &[StateNode], start_node_id: u32) -> u64 {
     while !frontier.is_empty() {
         for &node_id in &frontier {
             let node = &nodes[node_id as usize];
-            for neighbor_id in &node.outbound_links[..node.outbound_count as usize] {
+            let count = (node.outbound_count as usize).min(MAX_INLINE_EDGES);
+            for neighbor_id in &node.outbound_links[..count] {
                 let neighbor_idx = *neighbor_id as usize;
                 if neighbor_idx < nodes.len() {
                     edges_traversed += 1;
@@ -90,7 +49,8 @@ fn run_partitioned_frontier_bfs(nodes: &[StateNode], start_node_id: u32) -> u64 
     while !frontier.is_empty() {
         while let Some(node_id) = frontier.pop() {
             let node = &nodes[node_id as usize];
-            for neighbor_id in &node.outbound_links[..node.outbound_count as usize] {
+            let count = (node.outbound_count as usize).min(MAX_INLINE_EDGES);
+            for neighbor_id in &node.outbound_links[..count] {
                 let neighbor_idx = *neighbor_id as usize;
                 if neighbor_idx < nodes.len() {
                     edges_traversed += 1;
@@ -124,7 +84,8 @@ fn run_shared_cas_frontier_bfs(nodes: &[StateNode], start_node_id: u32) -> u64 {
         while let Some(node_id) = frontier.pop() {
             work_done = true;
             let node = &nodes[node_id as usize];
-            for neighbor_id in &node.outbound_links[..node.outbound_count as usize] {
+            let count = (node.outbound_count as usize).min(MAX_INLINE_EDGES);
+            for neighbor_id in &node.outbound_links[..count] {
                 let neighbor_idx = *neighbor_id as usize;
                 if neighbor_idx < nodes.len() {
                     edges_traversed += 1;
@@ -158,7 +119,7 @@ fn bench_engine_traversal(c: &mut Criterion) {
     ];
 
     for (label, count) in node_counts.iter() {
-        let nodes = generate_uniform_graph(*count);
+        let nodes = generate_uniform_graph(*count, 2, 42);
         let engine = SearchEngine::new(nodes);
 
         group.throughput(Throughput::Elements(*count as u64));
@@ -176,7 +137,7 @@ fn bench_engine_traversal(c: &mut Criterion) {
 fn bench_cache_cliff_uniform(c: &mut Criterion) {
     let mut group = c.benchmark_group("cache_cliff_uniform");
     for (label, count) in [("1M_uniform", 1_000_000), ("10M_uniform", 10_000_000)] {
-        let nodes = generate_uniform_graph(count);
+        let nodes = generate_uniform_graph(count, 2, 42);
         let engine = SearchEngine::new(nodes);
 
         group.throughput(Throughput::Elements(count as u64));
@@ -193,19 +154,19 @@ fn bench_cache_cliff_uniform(c: &mut Criterion) {
 fn bench_frontier_contention_power_law(c: &mut Criterion) {
     let mut group = c.benchmark_group("frontier_contention_power_law");
     let node_count = 100_000usize;
-    let nodes = generate_power_law_graph(node_count);
+    let rmat = generate_rmat_graph(node_count, 4, RmatConfig::default(), 42);
 
     group.throughput(Throughput::Elements(node_count as u64));
     group.bench_function("partitioned_frontier", |b| {
         b.iter(|| {
-            let edges = run_partitioned_frontier_bfs(&nodes, black_box(0));
+            let edges = run_partitioned_frontier_bfs(&rmat.nodes, black_box(0));
             black_box(edges);
         });
     });
 
     group.bench_function("shared_cas_frontier", |b| {
         b.iter(|| {
-            let edges = run_shared_cas_frontier_bfs(&nodes, black_box(0));
+            let edges = run_shared_cas_frontier_bfs(&rmat.nodes, black_box(0));
             black_box(edges);
         });
     });
@@ -216,7 +177,7 @@ fn bench_frontier_contention_power_law(c: &mut Criterion) {
 fn bench_engine_vs_baseline_100k(c: &mut Criterion) {
     let mut group = c.benchmark_group("engine_vs_baseline_100k");
     let node_count = 100_000usize;
-    let nodes = generate_uniform_graph(node_count);
+    let nodes = generate_uniform_graph(node_count, 2, 42);
 
     let engine = SearchEngine::new(nodes.clone());
     let baseline_edges = naive_bfs_edge_count(&nodes, 0);
@@ -239,7 +200,7 @@ fn bench_engine_vs_naive_baseline(c: &mut Criterion) {
     let mut group = c.benchmark_group("engine_vs_naive_baseline");
 
     for (label, count) in [("100K", 100_000usize), ("1M", 1_000_000usize)] {
-        let nodes = generate_uniform_graph(count);
+        let nodes = generate_uniform_graph(count, 2, 42);
         let engine = SearchEngine::new(nodes.clone());
         let baseline_edges = naive_bfs_edge_count(&nodes, 0);
         let engine_edges = engine.traverse_bfs(0);

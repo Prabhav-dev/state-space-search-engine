@@ -1,6 +1,7 @@
 use crate::frontier::SharedCasFrontier;
-use crate::hash::ZobristVisitedSet;
-use crate::node::StateNode;
+use crate::graph::SimpleRng;
+use crate::hash::{PathHasher, ZobristVisitedSet};
+use crate::node::{StateNode, MAX_INLINE_EDGES};
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -24,6 +25,32 @@ impl EngineScratch {
         self.visited.fill(0);
         self.cur.clear();
         self.next.clear();
+    }
+}
+
+/// Pre-allocated scratch space for parallel BFS execution to eliminate allocation overhead during timing.
+pub struct ParallelEngineScratch {
+    pub visited: Vec<AtomicBool>,
+    pub cur_queue: SharedCasFrontier,
+    pub next_queue: SharedCasFrontier,
+}
+
+impl ParallelEngineScratch {
+    pub fn new(capacity: usize) -> Self {
+        let visited = (0..capacity).map(|_| AtomicBool::new(false)).collect();
+        Self {
+            visited,
+            cur_queue: SharedCasFrontier::new(capacity),
+            next_queue: SharedCasFrontier::new(capacity),
+        }
+    }
+
+    pub fn reset(&mut self) {
+        for v in &self.visited {
+            v.store(false, Ordering::Relaxed);
+        }
+        self.cur_queue.clear();
+        self.next_queue.clear();
     }
 }
 
@@ -51,7 +78,7 @@ impl SearchEngine {
         }
     }
 
-    /// Initializes the search engine with state nodes and an overflow buffer (for degree > 4).
+    /// Initializes the search engine with state nodes and an overflow buffer (for degree > 3).
     pub fn with_overflow(nodes: Vec<StateNode>, overflow: Vec<u32>) -> Self {
         Self { nodes, overflow }
     }
@@ -67,16 +94,16 @@ impl SearchEngine {
         F: FnMut(u32),
     {
         let count = node.outbound_count as usize;
-        if count <= 4 {
+        if count <= MAX_INLINE_EDGES {
             for &v in &node.outbound_links[..count] {
                 f(v);
             }
         } else {
-            for &v in &node.outbound_links[..3] {
+            for &v in &node.outbound_links[..MAX_INLINE_EDGES] {
                 f(v);
             }
             let overflow_offset = node.outbound_links[3] as usize;
-            let remaining = count - 3;
+            let remaining = count - MAX_INLINE_EDGES;
             if overflow_offset + remaining <= self.overflow.len() {
                 for &v in &self.overflow[overflow_offset..overflow_offset + remaining] {
                     f(v);
@@ -126,7 +153,7 @@ impl SearchEngine {
         edges_traversed
     }
 
-    /// Performs multi-threaded level-synchronous BFS using per-thread partitioned frontiers (H1 / Step 5).
+    /// Convenience wrapper for multi-threaded level-synchronous BFS using per-thread partitioned frontiers.
     pub fn traverse_parallel_bfs(&self, start_node_id: u32, num_threads: usize) -> u64 {
         if self.nodes.is_empty() || start_node_id as usize >= self.nodes.len() {
             return 0;
@@ -136,11 +163,27 @@ impl SearchEngine {
             .num_threads(num_threads)
             .build()
             .unwrap();
+        let mut scratch = ParallelEngineScratch::new(self.nodes.len());
+
+        self.traverse_parallel_bfs_with_pool_and_scratch(start_node_id, &pool, &mut scratch)
+    }
+
+    /// Zero-allocation multi-threaded level-synchronous BFS using pre-instantiated thread pool & scratch buffers.
+    pub fn traverse_parallel_bfs_with_pool_and_scratch(
+        &self,
+        start_node_id: u32,
+        pool: &rayon::ThreadPool,
+        scratch: &mut ParallelEngineScratch,
+    ) -> u64 {
+        if self.nodes.is_empty() || start_node_id as usize >= self.nodes.len() {
+            return 0;
+        }
+
+        scratch.reset();
+        let visited = &scratch.visited;
+        let num_threads = pool.current_num_threads();
 
         pool.install(|| {
-            let visited: Vec<AtomicBool> = (0..self.nodes.len())
-                .map(|_| AtomicBool::new(false))
-                .collect();
             let total_edges = AtomicU64::new(0);
 
             visited[start_node_id as usize].store(true, Ordering::Relaxed);
@@ -180,7 +223,7 @@ impl SearchEngine {
         })
     }
 
-    /// Performs multi-threaded BFS using a Shared CAS Atomic Queue frontier to directly test H2 (Shared CAS vs Partitioned).
+    /// Convenience wrapper for Shared CAS Atomic Queue frontier parallel BFS.
     pub fn traverse_parallel_shared_cas_bfs(&self, start_node_id: u32, num_threads: usize) -> u64 {
         if self.nodes.is_empty() || start_node_id as usize >= self.nodes.len() {
             return 0;
@@ -190,21 +233,36 @@ impl SearchEngine {
             .num_threads(num_threads)
             .build()
             .unwrap();
+        let mut scratch = ParallelEngineScratch::new(self.nodes.len());
+
+        self.traverse_parallel_shared_cas_bfs_with_pool_and_scratch(start_node_id, &pool, &mut scratch)
+    }
+
+    /// Zero-allocation, fully multi-threaded Shared CAS frontier parallel BFS using pre-allocated pool & scratch.
+    pub fn traverse_parallel_shared_cas_bfs_with_pool_and_scratch(
+        &self,
+        start_node_id: u32,
+        pool: &rayon::ThreadPool,
+        scratch: &mut ParallelEngineScratch,
+    ) -> u64 {
+        if self.nodes.is_empty() || start_node_id as usize >= self.nodes.len() {
+            return 0;
+        }
+
+        scratch.reset();
+        let visited = &scratch.visited;
+        let mut cur_queue = &scratch.cur_queue;
+        let mut next_queue = &scratch.next_queue;
+        let num_threads = pool.current_num_threads();
 
         pool.install(|| {
-            let visited: Vec<AtomicBool> = (0..self.nodes.len())
-                .map(|_| AtomicBool::new(false))
-                .collect();
             let total_edges = AtomicU64::new(0);
-
-            let cur_queue = SharedCasFrontier::new(self.nodes.len());
-            let next_queue = SharedCasFrontier::new(self.nodes.len());
 
             visited[start_node_id as usize].store(true, Ordering::Relaxed);
             cur_queue.push(start_node_id);
 
             loop {
-                // Execute level processing across threads reading from shared CAS frontier
+                // Execute level processing across threads reading from shared CAS frontier concurrently
                 let active_threads: usize = (0..num_threads)
                     .into_par_iter()
                     .map(|_| {
@@ -233,25 +291,26 @@ impl SearchEngine {
                 }
 
                 cur_queue.clear();
-                // Swap queues logic (copy remaining or re-push)
-                while let Some(v) = next_queue.pop() {
-                    cur_queue.push(v);
-                }
-                next_queue.clear();
+                std::mem::swap(&mut cur_queue, &mut next_queue);
             }
 
             total_edges.load(Ordering::Relaxed)
         })
     }
 
-    /// Evaluates Zobrist bitstate search (H3):
-    /// 1. `evaluate_zobrist_bitstate_coverage`: Runs actual bitstate search (skipping enqueuing on Zobrist bit set).
-    ///    Returns (nodes_visited, exact_reachable_nodes, coverage_percentage, false_positives).
+    /// Evaluates Zobrist bitstate search (H3) using true 64-bit Zobrist XOR hashing.
+    /// Returns (nodes_visited, exact_reachable_nodes, coverage_percentage, false_positives).
     pub fn evaluate_zobrist_bitstate_coverage(
         &self,
         start_node_id: u32,
         power_of_two_bits: usize,
     ) -> (usize, usize, f64, usize) {
+        // Generate pseudo-random 64-bit Zobrist keys for all nodes
+        let mut rng = SimpleRng::new(0x9E37_79B9_7F4A_7C15);
+        let zobrist_keys: Vec<u64> = (0..self.nodes.len())
+            .map(|_| rng.next_u64())
+            .collect();
+
         let mut zobrist_set = ZobristVisitedSet::new(power_of_two_bits);
         let mut exact_visited = vec![false; self.nodes.len()];
 
@@ -263,29 +322,36 @@ impl SearchEngine {
 
         let start_idx = start_node_id as usize;
         if start_idx < self.nodes.len() {
-            cur.push(start_node_id);
-            zobrist_set.test_and_set(start_node_id as u64);
+            let start_hash = PathHasher::new(zobrist_keys[start_idx]).hash();
+            cur.push((start_node_id, start_hash));
+            zobrist_set.test_and_set(start_hash);
             exact_visited[start_idx] = true;
             bitstate_nodes_reached += 1;
         }
 
         while !cur.is_empty() {
-            for &node_id in &cur {
+            for &(node_id, path_hash) in &cur {
                 let node = &self.nodes[node_id as usize];
 
                 self.for_each_neighbor(node, |neighbor_id| {
                     let neighbor_idx = neighbor_id as usize;
                     if neighbor_idx < self.nodes.len() {
-                        let zobrist_hit = zobrist_set.test_and_set(neighbor_id as u64);
+                        let mut hasher = PathHasher::new(path_hash);
+                        hasher.update(zobrist_keys[neighbor_idx], 1);
+                        let neighbor_hash = hasher.hash();
+
+                        let zobrist_hit = zobrist_set.test_and_set(neighbor_hash);
                         let exact_already = exact_visited[neighbor_idx];
 
                         if zobrist_hit && !exact_already {
                             // False positive: Zobrist bit table hit, but state was NOT visited in exact search!
                             false_positives += 1;
                         } else if !zobrist_hit {
-                            exact_visited[neighbor_idx] = true;
-                            bitstate_nodes_reached += 1;
-                            next.push(neighbor_id);
+                            if !exact_already {
+                                exact_visited[neighbor_idx] = true;
+                                bitstate_nodes_reached += 1;
+                            }
+                            next.push((neighbor_id, neighbor_hash));
                         }
                     }
                 });

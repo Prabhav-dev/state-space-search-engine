@@ -1,0 +1,61 @@
+--- SESSION 3 RAW TIMINGS (ms) ---
+Size=100000 | Run=0 | Edges=159434 | Time=3.2074 ms
+Size=100000 | Run=1 | Edges=159434 | Time=1.2547 ms
+Size=100000 | Run=2 | Edges=159434 | Time=1.0633 ms
+Size=100000 | Run=3 | Edges=159434 | Time=1.0975 ms
+Size=100000 | Run=4 | Edges=159434 | Time=1.0724 ms
+Size=100000 | Run=5 | Edges=159434 | Time=1.1287 ms
+Size=100000 | Run=6 | Edges=159434 | Time=1.1719 ms
+Size=100000 | Run=7 | Edges=159434 | Time=1.1339 ms
+Size=100000 | Run=8 | Edges=159434 | Time=1.3310 ms
+Size=100000 | Run=9 | Edges=159434 | Time=1.1902 ms
+Size=100000 | Run=10 | Edges=159434 | Time=1.0983 ms
+Size=100000 | Run=11 | Edges=159434 | Time=1.0584 ms
+Size=100000 | Run=12 | Edges=159434 | Time=1.0643 ms
+Size=100000 | SESSION 3 MEDIAN = 1.1287 ms
+
+Size=500000 | Run=0 | Edges=797676 | Time=13.9938 ms
+Size=500000 | Run=1 | Edges=797676 | Time=15.1412 ms
+Size=500000 | Run=2 | Edges=797676 | Time=14.7219 ms
+Size=500000 | Run=3 | Edges=797676 | Time=14.5319 ms
+Size=500000 | Run=4 | Edges=797676 | Time=14.0508 ms
+Size=500000 | Run=5 | Edges=797676 | Time=13.7932 ms
+Size=500000 | Run=6 | Edges=797676 | Time=13.6957 ms
+Size=500000 | Run=7 | Edges=797676 | Time=13.3823 ms
+Size=500000 | Run=8 | Edges=797676 | Time=16.4774 ms
+Size=500000 | Run=9 | Edges=797676 | Time=14.1810 ms
+Size=500000 | Run=10 | Edges=797676 | Time=14.8383 ms
+Size=500000 | Run=11 | Edges=797676 | Time=14.1918 ms
+Size=500000 | Run=12 | Edges=797676 | Time=13.9082 ms
+Size=500000 | SESSION 3 MEDIAN = 14.1810 ms
+
+Size=1000000 | Run=0 | Edges=1592320 | Time=34.6401 ms
+Size=1000000 | Run=1 | Edges=1592320 | Time=33.5466 ms
+Size=1000000 | Run=2 | Edges=1592320 | Time=33.5495 ms
+Size=1000000 | Run=3 | Edges=1592320 | Time=33.6945 ms
+Size=1000000 | Run=4 | Edges=1592320 | Time=33.6007 ms
+Size=1000000 | Run=5 | Edges=1592320 | Time=33.8190 ms
+Size=1000000 | Run=6 | Edges=1592320 | Time=33.5131 ms
+Size=1000000 | Run=7 | Edges=1592320 | Time=33.5435 ms
+Size=1000000 | Run=8 | Edges=1592320 | Time=33.5952 ms
+Size=1000000 | Run=9 | Edges=1592320 | Time=35.2680 ms
+Size=1000000 | Run=10 | Edges=1592320 | Time=33.6035 ms
+Size=1000000 | Run=11 | Edges=1592320 | Time=34.0731 ms
+Size=1000000 | Run=12 | Edges=1592320 | Time=34.9866 ms
+Size=1000000 | SESSION 3 MEDIAN = 33.6945 ms
+
+Size=4000000 | Run=0 | Edges=6375606 | Time=152.8096 ms
+Size=4000000 | Run=1 | Edges=6375606 | Time=157.4956 ms
+Size=4000000 | Run=2 | Edges=6375606 | Time=159.3746 ms
+Size=4000000 | Run=3 | Edges=6375606 | Time=157.1443 ms
+Size=4000000 | Run=4 | Edges=6375606 | Time=155.6305 ms
+Size=4000000 | Run=5 | Edges=6375606 | Time=156.6287 ms
+Size=4000000 | Run=6 | Edges=6375606 | Time=156.8352 ms
+Size=4000000 | Run=7 | Edges=6375606 | Time=155.6851 ms
+Size=4000000 | Run=8 | Edges=6375606 | Time=156.3679 ms
+Size=4000000 | Run=9 | Edges=6375606 | Time=175.3229 ms
+Size=4000000 | Run=10 | Edges=6375606 | Time=173.7485 ms
+Size=4000000 | Run=11 | Edges=6375606 | Time=170.2554 ms
+Size=4000000 | Run=12 | Edges=6375606 | Time=157.5731 ms
+Size=4000000 | SESSION 3 MEDIAN = 157.1443 ms
+

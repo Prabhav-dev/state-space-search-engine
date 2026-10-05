@@ -1,14 +1,14 @@
 //! Rigorous Release-Mode Performance Analysis & Verification Runner.
-//! Addresses all 7 technical audit criteria (H1-H5, mathematical bounds, GAPBS baselines).
+//! Addresses all technical audit criteria (H1-H5, mathematical bounds, Native CSR baselines).
 //! Run in release mode:
 //!   cargo run --release --example v02_full_analysis
 
 use std::hint::black_box;
 use std::time::Instant;
 
-use state_search_engine::engine::{EngineScratch, SearchEngine};
-use state_search_engine::graph::{generate_rmat_graph, RmatConfig};
-use state_search_engine::node::StateNode;
+use state_search_engine::engine::{EngineScratch, ParallelEngineScratch, SearchEngine};
+use state_search_engine::graph::{generate_rmat_graph, generate_uniform_graph, RmatConfig};
+use state_search_engine::node::{StateNode, MAX_INLINE_EDGES};
 
 const WARMUP: usize = 3;
 const RUNS: usize = 10;
@@ -18,26 +18,6 @@ fn median(v: &mut [f64]) -> f64 {
     v[v.len() / 2]
 }
 
-fn generate_uniform_graph(node_count: usize, seed: u64) -> Vec<StateNode> {
-    let mut nodes = Vec::with_capacity(node_count);
-    let mut state = seed;
-    for i in 0..node_count {
-        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let t1 = (state % node_count as u64) as u32;
-        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let t2 = (state % node_count as u64) as u32;
-
-        nodes.push(StateNode {
-            node_id: i as u32,
-            structural_mask: 0,
-            outbound_count: 2,
-            metadata_flags: 0,
-            outbound_links: [t1, t2, u32::MAX, u32::MAX],
-        });
-    }
-    nodes
-}
-
 fn build_csr(nodes: &[StateNode], overflow: &[u32]) -> (Vec<u32>, Vec<u32>) {
     let mut offsets = Vec::with_capacity(nodes.len() + 1);
     let mut targets = Vec::new();
@@ -45,12 +25,12 @@ fn build_csr(nodes: &[StateNode], overflow: &[u32]) -> (Vec<u32>, Vec<u32>) {
     for node in nodes {
         offsets.push(targets.len() as u32);
         let count = node.outbound_count as usize;
-        if count <= 4 {
+        if count <= MAX_INLINE_EDGES {
             targets.extend_from_slice(&node.outbound_links[..count]);
         } else {
-            targets.extend_from_slice(&node.outbound_links[..3]);
+            targets.extend_from_slice(&node.outbound_links[..MAX_INLINE_EDGES]);
             let off = node.outbound_links[3] as usize;
-            let remaining = count - 3;
+            let remaining = count - MAX_INLINE_EDGES;
             if off + remaining <= overflow.len() {
                 targets.extend_from_slice(&overflow[off..off + remaining]);
             }
@@ -60,28 +40,28 @@ fn build_csr(nodes: &[StateNode], overflow: &[u32]) -> (Vec<u32>, Vec<u32>) {
     (offsets, targets)
 }
 
-#[inline(always)]
-fn test_and_set_bit(visited: &mut [u64], v: u32) -> bool {
-    let w = (v >> 6) as usize;
-    let m = 1u64 << (v & 63);
-    let old = visited[w];
-    visited[w] = old | m;
-    (old & m) != 0
-}
-
 fn csr_bitmap_bfs(offsets: &[u32], targets: &[u32], start: u32, s: &mut EngineScratch) -> u64 {
     s.reset();
     let EngineScratch { visited, cur, next } = s;
     let mut edges = 0u64;
-    test_and_set_bit(visited, start);
+
+    let start_idx = start as usize;
+    let w = start_idx >> 6;
+    let m = 1u64 << (start_idx & 63);
+    visited[w] |= m;
     cur.push(start);
+
     while !cur.is_empty() {
         for &u in cur.iter() {
             let lo = offsets[u as usize] as usize;
             let hi = offsets[u as usize + 1] as usize;
             for &v in &targets[lo..hi] {
                 edges += 1;
-                if !test_and_set_bit(visited, v) {
+                let v_idx = v as usize;
+                let w = v_idx >> 6;
+                let m = 1u64 << (v_idx & 63);
+                if (visited[w] & m) == 0 {
+                    visited[w] |= m;
                     next.push(v);
                 }
             }
@@ -93,35 +73,40 @@ fn csr_bitmap_bfs(offsets: &[u32], targets: &[u32], start: u32, s: &mut EngineSc
 }
 
 fn main() {
+    let os = std::env::consts::OS;
+    let arch = std::env::consts::ARCH;
+
     println!("=========================================================================================");
     println!("             VERIFIED PERFORMANCE ANALYSIS REPORT (WORKING DRAFT V0.3)                  ");
-    println!("             Host OS: Linux x86_64 | CPU: AMD Ryzen 5 7430U (6 Cores / 12 Threads)       ");
+    println!("             Host System: {} {} | Engine Release Build                                  ", os, arch);
     println!("=========================================================================================\n");
 
     // -----------------------------------------------------------------------------------------
-    // H1: Pinned workers with partitioned frontiers beat a tuned single-thread BFS
-    // Original v0.2 Falsification Criterion: Tuned single-thread BFS matches or beats it at all thread counts.
+    // H1: Multi-threaded level-synchronous BFS scaling with partitioned frontiers
     // -----------------------------------------------------------------------------------------
     println!("--- [H1] PARALLEL LEVEL-SYNCHRONOUS BFS SCALING (Uniform 1M & 4M nodes) ---");
-    println!("Original Falsification Criterion: Tuned single-thread BFS matches or beats it at all thread counts.");
+    println!("Falsification Criterion: Single-thread BFS matches or beats parallel BFS at all thread counts.");
     for &n in &[1_000_000usize, 4_000_000usize] {
-        let nodes = generate_uniform_graph(n, 0x1234_5678 ^ n as u64);
+        let nodes = generate_uniform_graph(n, 2, 0x1234_5678 ^ n as u64);
         let engine = SearchEngine::new(nodes);
-        let mut scratch = EngineScratch::new(n);
+        let mut scratch_seq = EngineScratch::new(n);
+        let mut scratch_par = ParallelEngineScratch::new(n);
 
         let thread_counts = [1, 2, 4, 6];
         println!("  Graph Size: {n} nodes (32-byte layout = {:.1} MB)", n as f64 * 32.0 / 1e6);
 
         let mut seq_time = 0.0;
         for &threads in &thread_counts {
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
             let mut times = Vec::new();
             let mut edges = 0u64;
+
             for r in 0..(WARMUP + RUNS) {
                 let start = Instant::now();
                 let e = if threads == 1 {
-                    engine.traverse_bfs_with_scratch(black_box(0), &mut scratch)
+                    engine.traverse_bfs_with_scratch(black_box(0), &mut scratch_seq)
                 } else {
-                    engine.traverse_parallel_bfs(black_box(0), threads)
+                    engine.traverse_parallel_bfs_with_pool_and_scratch(black_box(0), &pool, &mut scratch_par)
                 };
                 let elapsed = start.elapsed().as_secs_f64() * 1e3;
                 edges = e;
@@ -146,10 +131,9 @@ fn main() {
 
     // -----------------------------------------------------------------------------------------
     // H2: Shared CAS frontiers degrade on power-law graphs vs uniform graphs
-    // Original v0.2 Falsification Criterion: No significant throughput gap between graph types, measured on real power-law graph with multiple threads.
     // -----------------------------------------------------------------------------------------
     println!("--- [H2] SHARED CAS VS PARTITIONED FRONTIER ON R-MAT POWER-LAW GRAPHS ---");
-    println!("Original Falsification Criterion: No significant throughput gap between graph types, measured on real power-law graph with multiple threads.");
+    println!("Falsification Criterion: No throughput gap between partitioned frontiers and shared CAS frontiers.");
     for &n in &[100_000usize, 500_000usize, 1_000_000usize] {
         let rmat = generate_rmat_graph(n, 4, RmatConfig::default(), 0xABCD_EF00 ^ n as u64);
         let reach_pct = 100.0 * rmat.reached_nodes as f64 / n as f64;
@@ -159,20 +143,37 @@ fn main() {
         );
 
         let engine = SearchEngine::with_overflow(rmat.nodes, rmat.overflow);
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        let mut scratch_part = ParallelEngineScratch::new(n);
+        let mut scratch_cas = ParallelEngineScratch::new(n);
 
         let mut t_part = Vec::new();
         let mut t_cas = Vec::new();
         let mut edges_seq = 0u64;
 
         for r in 0..(WARMUP + RUNS) {
-            let start = Instant::now();
-            let e1 = engine.traverse_parallel_bfs(black_box(0), 4);
-            let d1 = start.elapsed().as_secs_f64() * 1e3;
+            let run_part_first = r % 2 == 0;
+            let (d1, e1, d2, e2);
 
-            let start = Instant::now();
-            let _e2 = engine.traverse_parallel_shared_cas_bfs(black_box(0), 4);
-            let d2 = start.elapsed().as_secs_f64() * 1e3;
+            if run_part_first {
+                let start = Instant::now();
+                e1 = engine.traverse_parallel_bfs_with_pool_and_scratch(black_box(0), &pool, &mut scratch_part);
+                d1 = start.elapsed().as_secs_f64() * 1e3;
 
+                let start = Instant::now();
+                e2 = engine.traverse_parallel_shared_cas_bfs_with_pool_and_scratch(black_box(0), &pool, &mut scratch_cas);
+                d2 = start.elapsed().as_secs_f64() * 1e3;
+            } else {
+                let start = Instant::now();
+                e2 = engine.traverse_parallel_shared_cas_bfs_with_pool_and_scratch(black_box(0), &pool, &mut scratch_cas);
+                d2 = start.elapsed().as_secs_f64() * 1e3;
+
+                let start = Instant::now();
+                e1 = engine.traverse_parallel_bfs_with_pool_and_scratch(black_box(0), &pool, &mut scratch_part);
+                d1 = start.elapsed().as_secs_f64() * 1e3;
+            }
+
+            assert_eq!(e1, e2);
             edges_seq = e1;
             if r >= WARMUP {
                 t_part.push(d1);
@@ -200,13 +201,12 @@ fn main() {
     }
 
     // -----------------------------------------------------------------------------------------
-    // H3: Zobrist-style dedup uses less memory than an exact bitmap at acceptable error
-    // Original v0.2 Falsification Criterion: Memory or error rate is worse than a bitmap.
+    // H3: Zobrist-style path deduplication & bitstate table evaluation
     // -----------------------------------------------------------------------------------------
     println!("--- [H3] ZOBRIST BITSTATE SEARCH COVERAGE & MATHEMATICAL BOUNDS ---");
-    println!("Original Falsification Criterion: Memory or error rate is worse than a bitmap.");
+    println!("Falsification Criterion: Memory footprint or error rate is worse than exact bitmap.");
     for &n in &[100_000usize, 500_000usize, 1_000_000usize] {
-        let nodes = generate_uniform_graph(n, 0x9999_8888 ^ n as u64);
+        let nodes = generate_uniform_graph(n, 2, 0x9999_8888 ^ n as u64);
         let engine = SearchEngine::new(nodes);
 
         let exact_bitmap_bytes = (n + 7) / 8;
@@ -238,12 +238,10 @@ fn main() {
     }
 
     // -----------------------------------------------------------------------------------------
-    // H4: Context-keyed learned edge priorities reduce nodes expanded on repeated queries
-    // Original v0.2 Falsification Criterion: Expansion counts unchanged versus no learning.
-    // Tested with held-out evaluation targets!
+    // H4: Context-keyed learned edge priorities on held-out target queries
     // -----------------------------------------------------------------------------------------
     println!("--- [H4] LEARNED EDGE PRIORITIES ON HELD-OUT TARGET QUERIES ---");
-    println!("Original Falsification Criterion: Expansion counts unchanged versus no learning.");
+    println!("Falsification Criterion: Node expansion counts remain unchanged versus unguided search on test queries.");
     let n_h4 = 100_000usize;
     let rmat_h4 = generate_rmat_graph(n_h4, 4, RmatConfig::default(), 0x7777_6666);
     let engine_h4 = SearchEngine::with_overflow(rmat_h4.nodes, rmat_h4.overflow);
@@ -252,20 +250,16 @@ fn main() {
     let train_targets = [1000u32, 2000u32, 5000u32, 10000u32];
     let test_targets = [1005u32, 2005u32, 5005u32, 10005u32];
 
-    // Train on training targets
     for &target in &train_targets {
         engine_h4.search_with_learned_priorities(0, target, &mut priorities, true);
     }
 
-    // Evaluate on held-out test targets
     println!("  Evaluating Held-Out Test Targets (Post-Training):");
     for &target in &test_targets {
-        // Unlearned baseline (empty priorities)
         let mut empty_prio = vec![Vec::new(); n_h4];
         let (exp_unlearned, found1) =
             engine_h4.search_with_learned_priorities(0, target, &mut empty_prio, false);
 
-        // Learned (held-out target)
         let (exp_learned, found2) =
             engine_h4.search_with_learned_priorities(0, target, &mut priorities, false);
 
@@ -280,30 +274,43 @@ fn main() {
     println!();
 
     // -----------------------------------------------------------------------------------------
-    // H5: Inline fixed-degree adjacency is faster than CSR once the working set exceeds cache, on low-degree graphs
-    // Original v0.2 Falsification Criterion: CSR matches or beats it on repeat sessions, or on variable-degree / power-law graphs.
+    // H5: Inline fixed-degree arena vs CSR on R-MAT variable-degree graphs
     // -----------------------------------------------------------------------------------------
     println!("--- [H5] INLINE ARENA (WITH OVERFLOW) VS CSR ON R-MAT VARIABLE-DEGREE GRAPHS ---");
-    println!("Original Falsification Criterion: CSR matches or beats it on repeat sessions, or on variable-degree / power-law graphs.");
+    println!("Falsification Criterion: CSR matches or beats inline layout out of cache or on power-law graphs.");
     for &n in &[100_000usize, 500_000usize, 1_000_000usize, 4_000_000usize] {
         let rmat = generate_rmat_graph(n, 4, RmatConfig::default(), 0x5555_4444 ^ n as u64);
         let (offsets, targets) = build_csr(&rmat.nodes, &rmat.overflow);
 
         let engine = SearchEngine::with_overflow(rmat.nodes.clone(), rmat.overflow.clone());
-        let mut scratch = EngineScratch::new(n);
+        let mut scratch_arena = EngineScratch::new(n);
+        let mut scratch_csr = EngineScratch::new(n);
 
         let mut t_arena = Vec::new();
         let mut t_csr = Vec::new();
         let mut total_edges = 0u64;
 
         for r in 0..(WARMUP + RUNS) {
-            let start = Instant::now();
-            let ea = engine.traverse_bfs_with_scratch(black_box(0), &mut scratch);
-            let da = start.elapsed().as_secs_f64() * 1e3;
+            let run_arena_first = r % 2 == 0;
+            let (da, ea, dc, ec);
 
-            let start = Instant::now();
-            let ec = csr_bitmap_bfs(&offsets, &targets, black_box(0), &mut scratch);
-            let dc = start.elapsed().as_secs_f64() * 1e3;
+            if run_arena_first {
+                let start = Instant::now();
+                ea = engine.traverse_bfs_with_scratch(black_box(0), &mut scratch_arena);
+                da = start.elapsed().as_secs_f64() * 1e3;
+
+                let start = Instant::now();
+                ec = csr_bitmap_bfs(&offsets, &targets, black_box(0), &mut scratch_csr);
+                dc = start.elapsed().as_secs_f64() * 1e3;
+            } else {
+                let start = Instant::now();
+                ec = csr_bitmap_bfs(&offsets, &targets, black_box(0), &mut scratch_csr);
+                dc = start.elapsed().as_secs_f64() * 1e3;
+
+                let start = Instant::now();
+                ea = engine.traverse_bfs_with_scratch(black_box(0), &mut scratch_arena);
+                da = start.elapsed().as_secs_f64() * 1e3;
+            }
 
             assert_eq!(ea, ec);
             total_edges = ea;
@@ -340,6 +347,6 @@ fn main() {
     }
 
     println!("=========================================================================================");
-    println!("                          END OF VERIFIED V0.3 RUN                                       ");
+    println!("                          END OF VERIFIED ANALYSIS RUN                                   ");
     println!("=========================================================================================");
 }

@@ -1,7 +1,7 @@
 //! R-MAT / Kronecker power-law graph generator and graph analysis tools.
 //! Implements Step 4 of L3 State Solver Working Draft v0.2.
 
-use crate::node::StateNode;
+use crate::node::{StateNode, MAX_INLINE_EDGES};
 
 pub struct RmatConfig {
     pub a: f64,
@@ -30,25 +30,61 @@ pub struct RmatGraphResult {
     pub total_edges: usize,
 }
 
-struct SimpleRng(u64);
+pub struct SimpleRng(u64);
 impl SimpleRng {
-    fn new(seed: u64) -> Self {
+    pub fn new(seed: u64) -> Self {
         Self(seed)
     }
 
-    fn next_f64(&mut self) -> f64 {
+    pub fn next_u64(&mut self) -> u64 {
         // SplitMix64
         self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = self.0;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        let res = z ^ (z >> 31);
+        z ^ (z >> 31)
+    }
+
+    pub fn next_f64(&mut self) -> f64 {
+        let res = self.next_u64();
         (res >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    pub fn gen_range(&mut self, upper: u64) -> u64 {
+        if upper == 0 {
+            0
+        } else {
+            self.next_u64() % upper
+        }
     }
 }
 
+/// Generates a uniform random graph (Erdős–Rényi model) using a deterministic PRNG.
+pub fn generate_uniform_graph(node_count: usize, edges_per_node: usize, seed: u64) -> Vec<StateNode> {
+    let mut rng = SimpleRng::new(seed);
+    let mut nodes = Vec::with_capacity(node_count);
+
+    for i in 0..node_count {
+        let mut links = [u32::MAX; 4];
+        let count = edges_per_node.min(MAX_INLINE_EDGES);
+        for idx in 0..count {
+            links[idx] = rng.gen_range(node_count as u64) as u32;
+        }
+
+        nodes.push(StateNode {
+            node_id: i as u32,
+            structural_mask: 0,
+            outbound_count: count as u32,
+            metadata_flags: 0,
+            outbound_links: links,
+        });
+    }
+
+    nodes
+}
+
 /// Generates an R-MAT power-law graph.
-/// Each node's out-edges are populated into `StateNode`. If degree > 4, the first 3 out-edges are inline,
+/// Each node's out-edges are populated into `StateNode`. If degree > 3, the first 3 out-edges are inline,
 /// and `outbound_links[3]` holds the offset into `overflow` buffer.
 pub fn generate_rmat_graph(
     node_count: usize,
@@ -103,17 +139,17 @@ pub fn generate_rmat_graph(
         let deg = neighbors.len() as u32;
         let mut links = [u32::MAX; 4];
 
-        if deg <= 4 {
+        if deg as usize <= MAX_INLINE_EDGES {
             for (idx, &dst) in neighbors.iter().enumerate() {
                 links[idx] = dst;
             }
         } else {
             // First 3 inline, 4th slot points to overflow start index
-            for idx in 0..3 {
+            for idx in 0..MAX_INLINE_EDGES {
                 links[idx] = neighbors[idx];
             }
             links[3] = overflow.len() as u32;
-            overflow.extend_from_slice(&neighbors[3..]);
+            overflow.extend_from_slice(&neighbors[MAX_INLINE_EDGES..]);
         }
 
         nodes.push(StateNode {
@@ -161,7 +197,7 @@ pub fn analyze_graph_reachability(
             let node = &nodes[u as usize];
             let count = node.outbound_count as usize;
 
-            if count <= 4 {
+            if count <= MAX_INLINE_EDGES {
                 for &v in &node.outbound_links[..count] {
                     let v_idx = v as usize;
                     if v_idx < nodes.len() && !visited[v_idx] {
@@ -171,7 +207,7 @@ pub fn analyze_graph_reachability(
                     }
                 }
             } else {
-                for &v in &node.outbound_links[..3] {
+                for &v in &node.outbound_links[..MAX_INLINE_EDGES] {
                     let v_idx = v as usize;
                     if v_idx < nodes.len() && !visited[v_idx] {
                         visited[v_idx] = true;
@@ -180,13 +216,15 @@ pub fn analyze_graph_reachability(
                     }
                 }
                 let overflow_offset = node.outbound_links[3] as usize;
-                let remaining = count - 3;
-                for &v in &overflow[overflow_offset..overflow_offset + remaining] {
-                    let v_idx = v as usize;
-                    if v_idx < nodes.len() && !visited[v_idx] {
-                        visited[v_idx] = true;
-                        reached += 1;
-                        next_frontier.push(v);
+                let remaining = count - MAX_INLINE_EDGES;
+                if overflow_offset + remaining <= overflow.len() {
+                    for &v in &overflow[overflow_offset..overflow_offset + remaining] {
+                        let v_idx = v as usize;
+                        if v_idx < nodes.len() && !visited[v_idx] {
+                            visited[v_idx] = true;
+                            reached += 1;
+                            next_frontier.push(v);
+                        }
                     }
                 }
             }
@@ -197,3 +235,4 @@ pub fn analyze_graph_reachability(
 
     (reached, depth)
 }
+

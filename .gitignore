@@ -10,4 +10,5 @@ Thumbs.db
 
 # Logs & Temporary outputs
 *.log
+!raw_session_*.log
 *.txt

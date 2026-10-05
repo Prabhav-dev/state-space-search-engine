@@ -1,41 +1,21 @@
 //! Layout-isolating BFS comparison. Run with:
 //!   cargo run --release --example compare_baseline
-//!
-//! Three arms on the SAME random graph:
-//!   A) engine      - SearchEngine::traverse_bfs as it exists today
-//!   B) aos_bitmap  - same 32-byte StateNode arena, but bitmap visited + reused scratch buffers
-//!   C) csr_bitmap  - CSR (offsets + targets) with the same bitmap + scratch buffers
-//! A vs B  = implementation overhead of the engine's loop.
-//! B vs C  = the actual effect of the 32-byte node layout (the thing the thesis is about).
-//! Arms are interleaved each round so thermal / power drift hits all of them equally.
 
 use std::hint::black_box;
 use std::time::Instant;
 
-use state_search_engine::engine::SearchEngine;
-use state_search_engine::node::StateNode;
+use state_search_engine::engine::{EngineScratch, SearchEngine};
+use state_search_engine::graph::SimpleRng;
+use state_search_engine::node::{StateNode, MAX_INLINE_EDGES};
 
 const WARMUP: usize = 3;
 const RUNS: usize = 15;
 
-struct Rng(u64);
-impl Rng {
-    fn next(&mut self) -> u64 {
-        // splitmix64
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-}
-
-/// Uniform random graph, out-degree 2 (same degree as the current generator,
-/// but random targets instead of the affine i*7+1 / i*13+3 pattern).
+/// Uniform random graph, out-degree 2 using deterministic PRNG.
 fn random_edges(n: usize, seed: u64) -> Vec<[u32; 2]> {
-    let mut rng = Rng(seed);
+    let mut rng = SimpleRng::new(seed);
     (0..n)
-        .map(|_| [(rng.next() % n as u64) as u32, (rng.next() % n as u64) as u32])
+        .map(|_| [rng.gen_range(n as u64) as u32, rng.gen_range(n as u64) as u32])
         .collect()
 }
 
@@ -64,47 +44,26 @@ fn build_csr(edges: &[[u32; 2]]) -> (Vec<u32>, Vec<u32>) {
     (offsets, targets)
 }
 
-/// Reused across runs so allocation / page-fault cost is not in the timed region.
-struct Scratch {
-    visited: Vec<u64>,
-    cur: Vec<u32>,
-    next: Vec<u32>,
-}
-
-impl Scratch {
-    fn new(n: usize) -> Self {
-        Self {
-            visited: vec![0; (n + 63) / 64],
-            cur: Vec::with_capacity(n),
-            next: Vec::with_capacity(n),
-        }
-    }
-    fn reset(&mut self) {
-        self.visited.fill(0);
-        self.cur.clear();
-        self.next.clear();
-    }
-}
-
 #[inline(always)]
 fn test_and_set(visited: &mut [u64], v: u32) -> bool {
     let w = (v >> 6) as usize;
     let m = 1u64 << (v & 63);
     let old = visited[w];
     visited[w] = old | m;
-    old & m != 0
+    (old & m) != 0
 }
 
-fn aos_bitmap_bfs(nodes: &[StateNode], start: u32, s: &mut Scratch) -> u64 {
+fn aos_bitmap_bfs(nodes: &[StateNode], start: u32, s: &mut EngineScratch) -> u64 {
     s.reset();
-    let Scratch { visited, cur, next } = s;
+    let EngineScratch { visited, cur, next } = s;
     let mut edges = 0u64;
     test_and_set(visited, start);
     cur.push(start);
     while !cur.is_empty() {
         for &u in cur.iter() {
             let node = &nodes[u as usize];
-            for &v in &node.outbound_links[..node.outbound_count as usize] {
+            let count = (node.outbound_count as usize).min(MAX_INLINE_EDGES);
+            for &v in &node.outbound_links[..count] {
                 edges += 1;
                 if !test_and_set(visited, v) {
                     next.push(v);
@@ -117,9 +76,9 @@ fn aos_bitmap_bfs(nodes: &[StateNode], start: u32, s: &mut Scratch) -> u64 {
     edges
 }
 
-fn csr_bitmap_bfs(offsets: &[u32], targets: &[u32], start: u32, s: &mut Scratch) -> u64 {
+fn csr_bitmap_bfs(offsets: &[u32], targets: &[u32], start: u32, s: &mut EngineScratch) -> u64 {
     s.reset();
-    let Scratch { visited, cur, next } = s;
+    let EngineScratch { visited, cur, next } = s;
     let mut edges = 0u64;
     test_and_set(visited, start);
     cur.push(start);
@@ -154,15 +113,16 @@ fn main() {
         let aos = build_aos(&edges_list);
         let (offsets, targets) = build_csr(&edges_list);
         let engine = SearchEngine::new(aos.clone());
-        let mut s_aos = Scratch::new(n);
-        let mut s_csr = Scratch::new(n);
+        let mut s_engine = EngineScratch::new(n);
+        let mut s_aos = EngineScratch::new(n);
+        let mut s_csr = EngineScratch::new(n);
 
         let (mut ta, mut tb, mut tc) = (Vec::new(), Vec::new(), Vec::new());
         let mut edges_seen = 0u64;
 
         for r in 0..(WARMUP + RUNS) {
             let t = Instant::now();
-            let ea = engine.traverse_bfs(black_box(0));
+            let ea = engine.traverse_bfs_with_scratch(black_box(0), &mut s_engine);
             let da = t.elapsed().as_secs_f64() * 1e3;
 
             let t = Instant::now();
