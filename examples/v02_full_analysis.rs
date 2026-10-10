@@ -122,7 +122,7 @@ fn main() {
             let speedup = seq_time / med_ms;
             let eff = (speedup / threads as f64) * 100.0;
             println!(
-                "    Threads: {:2} | Time: {:8.3} ms | Throughput: {:6.1} MTEPS | Speedup: {:.2}x (Parallel Efficiency: {:.1}%)",
+                "    Thread {:2}T | Time: {:8.3} ms | Throughput: {:6.1} MTEPS | Speedup: {:.2}x (Parallel Efficiency: {:.1}%)",
                 threads, med_ms, mteps, speedup, eff
             );
         }

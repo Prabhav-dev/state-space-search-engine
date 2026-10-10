@@ -158,7 +158,7 @@ fn main() {
 
     println!("=========================================================================================");
     println!("        BENCHMARK COMPARISON: INLINE ARENA ENGINE VS NATIVE RUST CSR BASELINE            ");
-    println!("        Host System: {} {} | Threads Evaluated: 1, 4, 6                                ", os, arch);
+    println!("        Host System: {} {} | Thread Configurations: 1T, 4T, 6T                       ", os, arch);
     println!("=========================================================================================\n");
 
     for &n in &[500_000usize, 1_000_000usize, 4_000_000usize] {
@@ -241,7 +241,7 @@ fn main() {
             let ratio = m_csr / m_eng;
 
             println!(
-                "    Threads: {:2} | Engine: {:8.3} ms ({:5.1} MTEPS) | Native CSR: {:8.3} ms ({:5.1} MTEPS) | Win: {:.2}x ({})",
+                "    Thread {:2}T | Engine: {:8.3} ms ({:5.1} MTEPS) | Native CSR: {:8.3} ms ({:5.1} MTEPS) | Win: {:.2}x ({})",
                 threads,
                 m_eng,
                 mteps_eng,
