@@ -113,13 +113,14 @@ fn median(values: &mut [f64]) -> f64 {
 fn run() -> io::Result<()> {
     let machine = MachineState::capture(&THREAD_COUNTS);
     machine.print_header();
-    machine.require_ac_power()?;
-
     let mut log = CsvLog::create(
         "stage2_two_stage_prefetch",
         &machine,
-        "session,run,warmup,n,threads,prefetch,k,variant,elapsed_ms,edges,reached",
+        "session,run,warmup,n,threads,prefetch,k,variant,elapsed_ms,edges,reached,ac_battery,power_plan",
     )?;
+    log.record_session_state("startup", &machine);
+    log.flush()?;
+    machine.require_ac_power()?;
 
     for &num_nodes in &[4_000_000usize, 8_000_000] {
         let rmat = generate_rmat_graph(
@@ -158,6 +159,10 @@ fn run() -> io::Result<()> {
                 let mut session_v2 = Vec::with_capacity(SESSIONS);
 
                 for session in 0..SESSIONS {
+                    let session_machine = MachineState::capture_session(&[threads], session);
+                    log.record_session_state(&session.to_string(), &session_machine);
+                    log.flush()?;
+                    session_machine.require_ac_power()?;
                     let mut runs: [Vec<f64>; 2] =
                         std::array::from_fn(|_| Vec::with_capacity(TIMED_RUNS));
                     for run_index in 0..(WARMUPS + TIMED_RUNS) {
@@ -176,9 +181,10 @@ fn run() -> io::Result<()> {
                             );
                             let (elapsed_ms, edges, reached) = results[variant];
                             log.record(&format!(
-                                "{session},{run_index},{},{num_nodes},{threads},{prefetch_name},{k},{},{elapsed_ms:.6},{edges},{reached}",
+                                "{session},{run_index},{},{num_nodes},{threads},{prefetch_name},{k},{},{elapsed_ms:.6},{edges},{reached},{}",
                                 run_index < WARMUPS,
-                                VARIANT_NAMES[variant]
+                                VARIANT_NAMES[variant],
+                                session_machine.csv_session_fields()
                             ));
                         }
                         assert_eq!(results[0].1, results[1].1, "edge count mismatch for {prefetch_name}");
@@ -190,6 +196,7 @@ fn run() -> io::Result<()> {
                     }
                     session_v0.push(median(&mut runs[0]));
                     session_v2.push(median(&mut runs[1]));
+                    log.flush()?;
                 }
 
                 println!(

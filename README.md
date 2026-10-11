@@ -113,6 +113,10 @@ Statistical variance across 3 isolated benchmark runs on uniform random graphs (
     └── integration_tests.rs    # 10 integration tests validating engine correctness
 ```
 
+### Repository Artifacts
+
+The Git ignore rules exclude Rust build output (`target/`), editor and operating-system metadata, and local Python environments and caches. Raw benchmark session logs (`raw_session_*.log`) and benchmark evidence under `logs/` and `results/` are intentionally retained so the reported measurements can be inspected and reproduced.
+
 ---
 
 ## Quick Start & Reproduction Guide

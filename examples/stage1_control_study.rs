@@ -219,17 +219,36 @@ fn verify_graphs(
 }
 
 fn run() -> io::Result<()> {
-    let machine = MachineState::capture(&THREAD_COUNTS);
-    machine.print_header();
-    machine.require_ac_power()?;
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    let (sizes, threads_to_run) = if arguments.len() == 3 && arguments[0] == "--only-cell" {
+        let num_nodes = arguments[1].parse::<usize>().map_err(|error| {
+            io::Error::new(io::ErrorKind::InvalidInput, format!("invalid node count: {error}"))
+        })?;
+        let threads = arguments[2].parse::<usize>().map_err(|error| {
+            io::Error::new(io::ErrorKind::InvalidInput, format!("invalid thread count: {error}"))
+        })?;
+        (vec![num_nodes], vec![threads])
+    } else if arguments.is_empty() {
+        (vec![500_000usize, 1_000_000], THREAD_COUNTS.to_vec())
+    } else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "usage: stage1_control_study [--only-cell <nodes> <threads>]",
+        ));
+    };
 
+    let machine = MachineState::capture(&threads_to_run);
+    machine.print_header();
     let mut log = CsvLog::create(
         "stage1_control",
         &machine,
-        "session,run,warmup,n,threads,test_before_atomic,prefetch,variant,elapsed_ms,edges,reached",
+        "session,run,warmup,n,threads,test_before_atomic,prefetch,variant,elapsed_ms,edges,reached,ac_battery,power_plan",
     )?;
+    log.record_session_state("startup", &machine);
+    log.flush()?;
+    machine.require_ac_power()?;
 
-    for &num_nodes in &[500_000usize, 1_000_000] {
+    for &num_nodes in &sizes {
         let rmat = generate_rmat_graph(
             num_nodes,
             4,
@@ -243,16 +262,11 @@ fn run() -> io::Result<()> {
         verify_graphs(&native, &v0, &v2, &v3);
 
         println!("Graph N={num_nodes} | edges={} | order=Original", v0.num_edges);
-        for &threads in &THREAD_COUNTS {
+        for &threads in &threads_to_run {
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(threads)
                 .build()
                 .expect("thread pool creation should succeed");
-            let config = TraversalConfig {
-                num_threads: threads,
-                test_before_atomic: false,
-                prefetch: PrefetchMode::None,
-            };
             let mut single_scratch = SharedSingleScratch::new(num_nodes);
             let mut parallel_scratch = SharedParallelScratch::new(num_nodes);
             let graphs = [
@@ -261,70 +275,85 @@ fn run() -> io::Result<()> {
                 GraphRef::V2(&v2),
                 GraphRef::V3(&v3),
             ];
-            let mut session_medians: [Vec<f64>; 4] = std::array::from_fn(|_| Vec::with_capacity(SESSIONS));
-            let mut paired_v0_over_existing = Vec::with_capacity(SESSIONS);
+            for &test_before_atomic in &[false, true] {
+                let config = TraversalConfig {
+                    num_threads: threads,
+                    test_before_atomic,
+                    prefetch: PrefetchMode::None,
+                };
+                let mut session_medians: [Vec<f64>; 4] =
+                    std::array::from_fn(|_| Vec::with_capacity(SESSIONS));
+                let mut paired_v0_over_existing = Vec::with_capacity(SESSIONS);
 
-            for session in 0..SESSIONS {
-                let mut session_runs: [Vec<f64>; 4] =
-                    std::array::from_fn(|_| Vec::with_capacity(TIMED_RUNS));
-                for run_index in 0..(WARMUPS + TIMED_RUNS) {
-                    let first_variant = (session + run_index) % VARIANTS.len();
-                    let mut results = [(0.0, 0u64, 0usize); 4];
-                    for position in 0..VARIANTS.len() {
-                        let variant = (first_variant + position) % VARIANTS.len();
-                        let (elapsed_ms, edges, reached) = measure(
-                            &graphs[variant],
-                            threads,
-                            &pool,
-                            &config,
-                            &mut single_scratch,
-                            &mut parallel_scratch,
-                        );
-                        results[variant] = (elapsed_ms, edges, reached);
-                        log.record(&format!(
-                            "{session},{run_index},{},{num_nodes},{threads},{},{},{},{elapsed_ms:.6},{edges},{reached}",
-                            run_index < WARMUPS,
-                            config.test_before_atomic,
-                            "None",
-                            VARIANTS[variant]
-                        ));
-                    }
+                for session in 0..SESSIONS {
+                    let session_machine = MachineState::capture_session(&[threads], session);
+                    log.record_session_state(&session.to_string(), &session_machine);
+                    log.flush()?;
+                    session_machine.require_ac_power()?;
+                    let mut session_runs: [Vec<f64>; 4] =
+                        std::array::from_fn(|_| Vec::with_capacity(TIMED_RUNS));
+                    for run_index in 0..(WARMUPS + TIMED_RUNS) {
+                        let first_variant = (session + run_index) % VARIANTS.len();
+                        let mut results = [(0.0, 0u64, 0usize); 4];
+                        for position in 0..VARIANTS.len() {
+                            let variant = (first_variant + position) % VARIANTS.len();
+                            let (elapsed_ms, edges, reached) = measure(
+                                &graphs[variant],
+                                threads,
+                                &pool,
+                                &config,
+                                &mut single_scratch,
+                                &mut parallel_scratch,
+                            );
+                            results[variant] = (elapsed_ms, edges, reached);
+                            log.record(&format!(
+                                "{session},{run_index},{},{num_nodes},{threads},{},{},{},{elapsed_ms:.6},{edges},{reached},{}",
+                                run_index < WARMUPS,
+                                config.test_before_atomic,
+                                "None",
+                                VARIANTS[variant],
+                                session_machine.csv_session_fields()
+                            ));
+                        }
 
-                    let expected = results[1].1..=results[1].1;
-                    for (variant, result) in results.iter().enumerate() {
-                        assert_eq!(result.1, *expected.start(), "{} edge count differs from V0", VARIANTS[variant]);
-                        assert_eq!(result.2, results[1].2, "{} reached count differs from V0", VARIANTS[variant]);
-                        if run_index >= WARMUPS {
-                            session_runs[variant].push(result.0);
+                        for (variant, result) in results.iter().enumerate() {
+                            assert_eq!(result.1, results[1].1, "{} edge count differs from V0", VARIANTS[variant]);
+                            assert_eq!(result.2, results[1].2, "{} reached count differs from V0", VARIANTS[variant]);
+                            if run_index >= WARMUPS {
+                                session_runs[variant].push(result.0);
+                            }
                         }
                     }
+
+                    for variant in 0..VARIANTS.len() {
+                        session_medians[variant].push(median(&mut session_runs[variant]));
+                    }
+                    paired_v0_over_existing.push(
+                        session_medians[0][session] / session_medians[1][session],
+                    );
+                    log.flush()?;
                 }
 
-                for variant in 0..VARIANTS.len() {
-                    session_medians[variant].push(median(&mut session_runs[variant]));
-                }
-                paired_v0_over_existing.push(session_medians[0][session] / session_medians[1][session]);
-            }
-
-            let overhead_percent: Vec<f64> = paired_v0_over_existing
-                .iter()
-                .map(|ratio| (ratio - 1.0) * 100.0)
-                .collect();
-            println!(
-                "  {threads}T | V0 vs existing time overhead: {:+.2}% +/- {:.2}% (95% CI) | test_before_atomic=false",
-                mean(&overhead_percent),
-                ci_half_width(&overhead_percent)
-            );
-            for variant in 0..VARIANTS.len() {
-                let values = &session_medians[variant];
-                let average = mean(values);
+                let overhead_percent: Vec<f64> = paired_v0_over_existing
+                    .iter()
+                    .map(|ratio| (ratio - 1.0) * 100.0)
+                    .collect();
                 println!(
-                    "    {:18} {:8.3} ms +/- {:6.3} ms (95% CI), sample SD {:5.2}%",
-                    VARIANTS[variant],
-                    average,
-                    ci_half_width(values),
-                    sample_sd(values, average) / average * 100.0
+                    "  {threads}T | V0 vs existing overhead: {:+.2}% +/- {:.2}% (95% CI) | test_before_atomic={test_before_atomic}",
+                    mean(&overhead_percent),
+                    ci_half_width(&overhead_percent),
                 );
+                for variant in 0..VARIANTS.len() {
+                    let values = &session_medians[variant];
+                    let average = mean(values);
+                    println!(
+                        "    {:18} {:8.3} ms +/- {:6.3} ms (95% CI), sample SD {:5.2}%",
+                        VARIANTS[variant],
+                        average,
+                        ci_half_width(values),
+                        sample_sd(values, average) / average * 100.0
+                    );
+                }
             }
         }
     }

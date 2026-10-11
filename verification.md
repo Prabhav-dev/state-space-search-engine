@@ -113,3 +113,7 @@ cargo run --release --example v02_full_analysis
 # 4. Run baseline comparative benchmark
 cargo run --release --example external_baseline_comparison
 ```
+
+## 8. Reproducibility Artifacts and GitHub
+
+The repository keeps raw session logs (`raw_session_*.log`) and benchmark outputs under `logs/` and `results/`, including CSV data and generated tables. These files provide the evidence used to inspect and reproduce the measurements. Git ignore rules exclude local build output (`target/`), editor and operating-system metadata, and Python environments and caches; they do not exclude the benchmark evidence directories.

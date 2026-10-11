@@ -55,6 +55,7 @@ def main():
 
     session_medians = {key: median(values) for key, values in observations.items()}
     configurations = sorted({key[:3] for key in session_medians})
+    assert len(configurations) == 24, f"expected 24 Task 2 configurations, found {len(configurations)}"
     for n, threads, prefetch in configurations:
         for variant in ("V0", "V2"):
             for session in range(10):
@@ -70,6 +71,8 @@ def main():
     with output.open("w", encoding="utf-8", newline="\n") as report:
         with contextlib.redirect_stdout(report):
             print(f"Source CSV: `{args.csv_path.as_posix()}`\n")
+            print(f"Configurations tested: {len(configurations)}. Existing Native CSR was not recorded in this CSV, so no V2/V3-to-Existing ratios can be reconstructed.")
+            print("About 1 in 20 nominal 95% CIs can exclude 1 by chance under a no-effect model; no multiplicity correction was applied.")
             print("| N | Threads | Prefetch | Variant | Mean session median (ms) | Sample SD (%) | 95% CI (ms) |")
             print("|---:|---:|---|---|---:|---:|---:|")
             for n, threads, prefetch in configurations:
@@ -81,8 +84,8 @@ def main():
                         f"{sample_sd(values) / average * 100:.2f}% | +/- {ci_half_width(values):.6f} |"
                     )
 
-            print("\n| N | Threads | Prefetch | Paired V0 / V2 ratio | 95% CI | Status |")
-            print("|---:|---:|---|---:|---:|---|")
+            print("\n| N | Threads | Prefetch | Paired V0 / V2 ratio | 95% CI | 10% bar | Status vs 1.0 |")
+            print("|---:|---:|---|---:|---:|---|---|")
             for n, threads, prefetch in configurations:
                 ratios = [
                     session_medians[(n, threads, prefetch, session, "V0")]
@@ -113,7 +116,8 @@ def main():
                     status = "supported: V2 faster"
                 else:
                     status = "supported: V0 faster"
-                print(f"| {n} | {threads}T | {prefetch} | {average:.4f}x | +/- {ci:.4f}x | {status} |")
+                bar = "clears >=1.10x" if average - ci >= 1.10 and max(sd_v0_pct, sd_v2_pct) <= 8.0 else "does not clear"
+                print(f"| {n} | {threads}T | {prefetch} | {average:.4f}x | +/- {ci:.4f}x | {bar} | {status} |")
 
     print(f"Generated table: {output}")
 

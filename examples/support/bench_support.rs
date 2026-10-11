@@ -1,5 +1,6 @@
 use std::fs;
-use std::io;
+use std::io::{self, Write};
+use std::fs::OpenOptions;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -64,14 +65,31 @@ impl MachineState {
     }
 
     pub fn require_ac_power(&self) -> io::Result<()> {
-        if self.on_battery {
+        if self.on_battery || self.power_unknown {
             Err(io::Error::new(
                 io::ErrorKind::Other,
-                "benchmark refused because the system is on battery power",
+                if self.on_battery {
+                    "benchmark refused because the system is on battery power"
+                } else {
+                    "benchmark refused because AC/battery state could not be determined"
+                },
             ))
         } else {
             Ok(())
         }
+    }
+
+    pub fn capture_session(thread_counts: &[usize], session: usize) -> Self {
+        let state = Self::capture(thread_counts);
+        println!(
+            "SESSION POWER | session={} | AC/battery={} | power_plan={}",
+            session, state.ac_state, state.power_plan
+        );
+        state
+    }
+
+    pub fn csv_session_fields(&self) -> String {
+        format!("{},{}", csv_field(&self.ac_state), csv_field(&self.power_plan))
     }
 
     pub fn csv_preamble(&self) -> String {
@@ -104,6 +122,7 @@ impl MachineState {
 pub struct CsvLog {
     path: PathBuf,
     contents: String,
+    flushed_bytes: usize,
 }
 
 impl CsvLog {
@@ -113,7 +132,13 @@ impl CsvLog {
         let mut contents = machine.csv_preamble();
         contents.push_str(columns);
         contents.push('\n');
-        Ok(Self { path, contents })
+        fs::write(&path, &contents)?;
+        let flushed_bytes = contents.len();
+        Ok(Self {
+            path,
+            contents,
+            flushed_bytes,
+        })
     }
 
     pub fn record(&mut self, row: &str) {
@@ -121,13 +146,32 @@ impl CsvLog {
         self.contents.push('\n');
     }
 
-    #[allow(dead_code)]
-    pub fn add_header_comment(&mut self, comment: &str) {
-        self.contents.insert_str(0, &format!("# {comment}\n"));
+    pub fn record_session_state(&mut self, session: &str, state: &MachineState) {
+        self.contents.push_str(&format!(
+            "# SESSION {session} | AC/battery={} | power_plan={}\n",
+            state.ac_state, state.power_plan
+        ));
     }
 
-    pub fn finish(self) -> io::Result<PathBuf> {
-        fs::write(&self.path, self.contents)?;
+    pub fn flush(&mut self) -> io::Result<()> {
+        if self.flushed_bytes < self.contents.len() {
+            let mut file = OpenOptions::new().append(true).open(&self.path)?;
+            file.write_all(self.contents[self.flushed_bytes..].as_bytes())?;
+            self.flushed_bytes = self.contents.len();
+        }
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub fn add_header_comment(&mut self, comment: &str) -> io::Result<()> {
+        self.contents.insert_str(0, &format!("# {comment}\n"));
+        fs::write(&self.path, &self.contents)?;
+        self.flushed_bytes = self.contents.len();
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> io::Result<PathBuf> {
+        self.flush()?;
         Ok(self.path)
     }
 }
@@ -167,4 +211,8 @@ $status = New-Object SystemPowerStatus
 
 fn compact(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn csv_field(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
 }
